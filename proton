@@ -465,6 +465,47 @@ EXT2_IOC_SETFLAGS = 0x40086602
 
 EXT4_CASEFOLD_FL = 0x40000000
 
+def find_gptk_lib_dir():
+    """Locate the user's own Game Porting Toolkit install (never shipped with Proton).
+
+    Returns the "redist/lib" directory holding external/D3DMetal.framework and
+    wine/x86_64-{windows,unix}, or None."""
+    candidates = []
+    if "PROTON_MAC_GPTK" in os.environ:
+        base = os.environ["PROTON_MAC_GPTK"]
+        candidates += [base, os.path.join(base, "redist/lib"), os.path.join(base, "lib")]
+    support = os.path.expanduser("~/Library/Application Support/proton-macos/gptk")
+    if os.path.isdir(support):
+        for version in sorted(os.listdir(support), reverse=True):
+            candidates.append(os.path.join(support, version, "redist/lib"))
+    if os.path.isdir("/Volumes"):
+        for volume in sorted(os.listdir("/Volumes")):
+            if volume.startswith("Evaluation environment for Windows games"):
+                candidates.append(os.path.join("/Volumes", volume, "redist/lib"))
+    for c in candidates:
+        if file_exists(os.path.join(c, "external/D3DMetal.framework"), follow_symlinks=True) and \
+                file_exists(os.path.join(c, "wine/x86_64-windows/d3d11.dll"), follow_symlinks=True):
+            return c
+    return None
+
+def setup_gptk_overlay(gptk_lib, overlay_dir):
+    """Symlink the user's D3DMetal modules into a WINEDLLPATH entry of this prefix.
+
+    The unix modules find libd3dshared.dylib through @loader_path, and libd3dshared finds
+    D3DMetal.framework through its own @rpath, so all three live next to each other."""
+    unix_dir = os.path.join(overlay_dir, "x86_64-unix")
+    pe_dir = os.path.join(overlay_dir, "x86_64-windows")
+    for d in (unix_dir, pe_dir):
+        makedirs(d)
+        for name in os.listdir(d):
+            os.unlink(os.path.join(d, name))
+    for name in os.listdir(os.path.join(gptk_lib, "wine/x86_64-windows")):
+        os.symlink(os.path.join(gptk_lib, "wine/x86_64-windows", name), os.path.join(pe_dir, name))
+    for name in os.listdir(os.path.join(gptk_lib, "wine/x86_64-unix")):
+        os.symlink(os.path.join(gptk_lib, "wine/x86_64-unix", name), os.path.join(unix_dir, name))
+    for name in ("libd3dshared.dylib", "D3DMetal.framework"):
+        os.symlink(os.path.join(gptk_lib, "external", name), os.path.join(unix_dir, name))
+
 def set_dir_casefold_bit(dir_path):
     if IS_DARWIN:
         return
@@ -1532,9 +1573,13 @@ class Session:
             # dxvk is the macOS fork on MoltenVK (D3D10/11); the rest stays on Wine's builtins.
             have_dxvk = file_exists(g_proton.lib_dir + "wine/dxvk/x86_64-windows/d3d11.dll", follow_symlinks=True)
             self.mac_gfx = os.environ.get("PROTON_MAC_GFX", "dxvk" if have_dxvk else "wined3d")
+            self.gptk_lib = None
             if self.mac_gfx == "d3dmetal":
-                log("PROTON_MAC_GFX=d3dmetal is not integrated yet, falling back to " + ("dxvk" if have_dxvk else "wined3d"))
-                self.mac_gfx = "dxvk" if have_dxvk else "wined3d"
+                self.gptk_lib = find_gptk_lib_dir()
+                if not self.gptk_lib:
+                    log("PROTON_MAC_GFX=d3dmetal but no Game Porting Toolkit found (set PROTON_MAC_GPTK), falling back to " +
+                        ("dxvk" if have_dxvk else "wined3d"))
+                    self.mac_gfx = "dxvk" if have_dxvk else "wined3d"
             if self.mac_gfx == "dxvk" and not have_dxvk:
                 log("DXVK is not available, falling back to wined3d")
                 self.mac_gfx = "wined3d"
@@ -2033,6 +2078,18 @@ class Session:
             self.remote_debug_cmd = shlex.split(self.env["PROTON_REMOTE_DEBUG_CMD"])
         else:
             self.remote_debug_cmd = None
+
+        if IS_DARWIN and self.mac_gfx == "d3dmetal":
+            overlay = g_compatdata.path("gptk/")
+            setup_gptk_overlay(self.gptk_lib, overlay)
+            # searched before Wine's own modules (WINEDLLPATH comes after them)
+            prepend_to_env_str(self.env, "WINEDLLPATH_PREPEND", overlay, ":")
+            # ntdll loads libd3dshared early to route its ms_abi calls (see the D3DMetal port in Wine)
+            self.env["CX_APPLEGPTK_LIBD3DSHARED_PATH"] = os.path.join(self.gptk_lib, "external/libd3dshared.dylib")
+            self.env["CX_ACTIVE_GRAPHICS_BACKEND"] = "d3dmetal"
+            # builtin first, so Wine takes D3DMetal's modules from the overlay
+            for dll in ["d3d11", "d3d12", "dxgi", "d3d10"]:
+                self.dlloverrides[dll] = "b"
 
         if update_prefix_files:
             g_compatdata.setup_prefix()
