@@ -795,8 +795,15 @@ static NTSTATUS steamclient_init( Params *params, bool wow64 )
     LOAD_FUNC( Steam_GetAPICallResult );
     LOAD_FUNC( Steam_FreeLastCallback );
     LOAD_FUNC( Steam_ReleaseThreadLocalMemory );
-    LOAD_FUNC( Steam_IsKnownInterface );
-    LOAD_FUNC( Steam_NotifyMissingInterface );
+
+    /* Not exported by the macOS steamclient.dylib; treated as optional. */
+#define LOAD_FUNC_OPTIONAL( x )                                         \
+    if (!(p_##x = (decltype(p_##x))dlsym( steamclient, #x )))           \
+        WARN( "host steamclient does not export " #x "\n" );
+
+    LOAD_FUNC_OPTIONAL( Steam_IsKnownInterface );
+    LOAD_FUNC_OPTIONAL( Steam_NotifyMissingInterface );
+#undef LOAD_FUNC_OPTIONAL
 
     TRACE( "Loaded host steamclient from %s\n", debugstr_a(path) );
     return 0;
@@ -851,14 +858,16 @@ static NTSTATUS steamclient_Steam_ReleaseThreadLocalMemory( Params *params, bool
 template< typename Params >
 static NTSTATUS steamclient_Steam_IsKnownInterface( Params *params, bool wow64 )
 {
-    params->_ret = p_Steam_IsKnownInterface( params->version );
+    /* Without the host export, report the interface as known and let the actual
+     * interface lookup succeed or fail. */
+    params->_ret = p_Steam_IsKnownInterface ? p_Steam_IsKnownInterface( params->version ) : true;
     return 0;
 }
 
 template< typename Params >
 static NTSTATUS steamclient_Steam_NotifyMissingInterface( Params *params, bool wow64 )
 {
-    p_Steam_NotifyMissingInterface( params->pipe, params->version );
+    if (p_Steam_NotifyMissingInterface) p_Steam_NotifyMissingInterface( params->pipe, params->version );
     return 0;
 }
 
@@ -872,7 +881,7 @@ static void collapse_path( WCHAR *path, UINT mark )
     for (p = path; *p; p++) if (*p == '/') *p = '\\';
 
     /* collapse duplicate backslashes */
-    next = path + std::max( 1u, mark );
+    next = path + (std::max)( 1u, mark ); /* parenthesized: windef.h may define max() */
     for (p = next; *p; p++) if (*p != '\\' || next[-1] != '\\') *next++ = *p;
     *next = 0;
 
