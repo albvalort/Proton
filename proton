@@ -1002,7 +1002,7 @@ class CompatData:
             steamdir = os.environ["STEAM_COMPAT_CLIENT_INSTALL_PATH"]
 
             use_wined3d = "wined3d" in g_session.compat_config
-            use_dxvk_dxgi = not use_wined3d and \
+            use_dxvk_dxgi = not use_wined3d and not IS_DARWIN and \
                     not ("WINEDLLOVERRIDES" in g_session.env and "dxgi=b" in g_session.env["WINEDLLOVERRIDES"])
             use_nvapi = (('disablenvapi' not in g_session.compat_config or 'forcenvapi' in g_session.compat_config) and
                         g_proton.host_pe_arch != "aarch64-windows" and not IS_DARWIN)
@@ -1160,6 +1160,11 @@ class CompatData:
                     dxvkfiles = []
                     vkd3d_protonfiles = []
                     wined3dfiles = ["d3d12", "d3d11", "d3d10", "d3d10core", "d3d10_1", "d3d9"]
+                elif IS_DARWIN:
+                    # DXVK-macOS only provides D3D10/11; D3D9/12 stay on Wine (wined3d, vkd3d).
+                    dxvkfiles = ["d3d11", "d3d10core"]
+                    vkd3d_protonfiles = []
+                    wined3dfiles = ["d3d12", "d3d10", "d3d10_1", "d3d9"]
                 else:
                     dxvkfiles = ["d3d11", "d3d10core", "d3d9"]
                     vkd3d_protonfiles = ["d3d12", "d3d12core"]
@@ -1523,8 +1528,17 @@ class Session:
                     self.compat_config.add(cur)
 
         if IS_DARWIN:
-            # PROTON_MAC_GFX=d3dmetal|dxvk|wined3d; only wined3d is available for now.
-            if os.environ.get("PROTON_MAC_GFX", "wined3d") == "wined3d":
+            # PROTON_MAC_GFX=dxvk|d3dmetal|wined3d, see docs/adr/0004-graphics-backends.md.
+            # dxvk is the macOS fork on MoltenVK (D3D10/11); the rest stays on Wine's builtins.
+            have_dxvk = file_exists(g_proton.lib_dir + "wine/dxvk/x86_64-windows/d3d11.dll", follow_symlinks=True)
+            self.mac_gfx = os.environ.get("PROTON_MAC_GFX", "dxvk" if have_dxvk else "wined3d")
+            if self.mac_gfx == "d3dmetal":
+                log("PROTON_MAC_GFX=d3dmetal is not integrated yet, falling back to " + ("dxvk" if have_dxvk else "wined3d"))
+                self.mac_gfx = "dxvk" if have_dxvk else "wined3d"
+            if self.mac_gfx == "dxvk" and not have_dxvk:
+                log("DXVK is not available, falling back to wined3d")
+                self.mac_gfx = "wined3d"
+            if self.mac_gfx != "dxvk":
                 self.compat_config.add("wined3d")
 
         #turn forcelgadd on by default unless it is disabled in compat config
@@ -1973,6 +1987,8 @@ class Session:
                     self.log_file.write("SteamGameId: " + self.env["SteamGameId"] + "\n")
                 self.log_file.write("Command: " + str(sys.argv[2:] + self.cmdlineappend) + "\n")
                 self.log_file.write("Options: " + str(self.compat_config) + "\n")
+                if IS_DARWIN:
+                    self.log_file.write("Graphics: " + self.mac_gfx + "\n")
 
                 self.try_log_slr_versions()
 
