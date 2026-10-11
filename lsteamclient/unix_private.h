@@ -3,6 +3,10 @@
 
 #include <stdarg.h>
 #include <stddef.h>
+/* Must precede winbase.h, which poisons wcsncpy/strncpy with macros (libc++ on macOS pulls
+ * these headers in later than glibc does). */
+#include <string.h>
+#include <wchar.h>
 
 #include <windef.h>
 #include <winbase.h>
