@@ -44,7 +44,11 @@ from random import randrange
 CURRENT_PREFIX_VERSION="11.0-100"
 
 PFX="Proton: "
-ld_path_var = "LD_LIBRARY_PATH"
+IS_DARWIN = sys.platform == "darwin"
+
+# macOS: Wine dlopen()s its unix-side dependencies (FreeType, ...) by leaf name, resolved through
+# DYLD_FALLBACK_LIBRARY_PATH; LD_LIBRARY_PATH means nothing to dyld.
+ld_path_var = "DYLD_FALLBACK_LIBRARY_PATH" if IS_DARWIN else "LD_LIBRARY_PATH"
 
 def file_exists(s, *, follow_symlinks):
     if follow_symlinks:
@@ -462,6 +466,8 @@ EXT2_IOC_SETFLAGS = 0x40086602
 EXT4_CASEFOLD_FL = 0x40000000
 
 def set_dir_casefold_bit(dir_path):
+    if IS_DARWIN:
+        return
     dr = os.open(dir_path, 0o644)
     if dr < 0:
         return
@@ -999,7 +1005,7 @@ class CompatData:
             use_dxvk_dxgi = not use_wined3d and \
                     not ("WINEDLLOVERRIDES" in g_session.env and "dxgi=b" in g_session.env["WINEDLLOVERRIDES"])
             use_nvapi = (('disablenvapi' not in g_session.compat_config or 'forcenvapi' in g_session.compat_config) and
-                        g_proton.host_pe_arch != "aarch64-windows")
+                        g_proton.host_pe_arch != "aarch64-windows" and not IS_DARWIN)
             use_dxvk_d3d8 = "dxvkd3d8" in g_session.compat_config
 
             builtin_dll_copy = os.environ.get("PROTON_DLL_COPY",
@@ -1098,6 +1104,15 @@ class CompatData:
                     if os.path.isfile(srcfile):
                         try_copy(srcfile, steam_dir + tgt, prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
 
+                if IS_DARWIN:
+                    # No Windows steamclient DLLs to redirect (and the 32-bit redirection assumes
+                    # Valve's real DLL), so point steam_api at lsteamclient directly. In a WoW64
+                    # process system32 resolves to syswow64, so one path serves both.
+                    lsteamclient_path = '"C:\\\\windows\\\\system32\\\\lsteamclient.dll"\n'
+                    for name in ["SteamClientDll", "SteamClientDll64"]:
+                        get_replace_reg_value(self.prefix_dir + "user.reg", "Software\\\\Valve\\\\Steam\\\\ActiveProcess",
+                                              name, lsteamclient_path)
+
                 filestocopy = [("steamclient64.dll", "steamclient64.dll"),
                                ("GameOverlayRenderer.dll", "GameOverlayRenderer.dll"),
                                ("GameOverlayRenderer64.dll", "GameOverlayRenderer64.dll")]
@@ -1120,20 +1135,21 @@ class CompatData:
                         shutil.copyfile(srcvdf, dstvdf)
 
                 #copy openvr files into place
+                vr_optional = IS_DARWIN
                 makedirs(self.prefix_dir + "/drive_c/vrclient/bin")
                 try_copy(g_proton.arch_pe_dir("wine", True) + "vrclient.dll", "drive_c/vrclient/bin",
-                        prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+                        prefix=self.prefix_dir, track_file=tracked_files, link_debug=True, optional=vr_optional)
                 try_copy(g_proton.arch_pe_dir("wine", False) + "vrclient_x64.dll", "drive_c/vrclient/bin",
-                        prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+                        prefix=self.prefix_dir, track_file=tracked_files, link_debug=True, optional=vr_optional)
 
                 try_copy(g_proton.arch_pe_dir("wine/dxvk", True) + "openvr_api_dxvk.dll", "drive_c/windows/syswow64",
-                        prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+                        prefix=self.prefix_dir, track_file=tracked_files, link_debug=True, optional=vr_optional)
                 try_copy(g_proton.arch_pe_dir("wine/dxvk", False) + "openvr_api_dxvk.dll", "drive_c/windows/system32",
-                        prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+                        prefix=self.prefix_dir, track_file=tracked_files, link_debug=True, optional=vr_optional)
 
                 makedirs(self.prefix_dir + "/drive_c/openxr")
                 try_copy(g_proton.dist_dir + "share/openxr/wineopenxr64.json", "drive_c/openxr",
-                        prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+                        prefix=self.prefix_dir, track_file=tracked_files, link_debug=True, optional=vr_optional)
 
                 #copy contrib dlls
                 try_copy(g_proton.contrib_dir + "amdxcffx64.dll", "drive_c/windows/system32",
@@ -1506,6 +1522,11 @@ class Session:
                 else:
                     self.compat_config.add(cur)
 
+        if IS_DARWIN:
+            # PROTON_MAC_GFX=d3dmetal|dxvk|wined3d; only wined3d is available for now.
+            if os.environ.get("PROTON_MAC_GFX", "wined3d") == "wined3d":
+                self.compat_config.add("wined3d")
+
         #turn forcelgadd on by default unless it is disabled in compat config
         if "noforcelgadd" not in self.compat_config:
             self.compat_config.add("forcelgadd")
@@ -1548,8 +1569,13 @@ class Session:
             # Allow wine to restore this when calling an external app.
             self.env['ORIG_'+ld_path_var] = os.environ.get(ld_path_var, '')
 
-        ld_library_path = [g_proton.lib_dir + "x86_64-linux-gnu", g_proton.lib_dir + "aarch64-linux-gnu", g_proton.lib_dir + "i386-linux-gnu"]
-        prepend_to_env_str(self.env, ld_path_var, ':'.join(ld_library_path), ":")
+        if IS_DARWIN:
+            # Setting DYLD_FALLBACK_LIBRARY_PATH replaces dyld's default, so keep the system dirs.
+            ld_library_path = [g_proton.lib_dir]
+            prepend_to_env_str(self.env, ld_path_var, ':'.join(ld_library_path + ["/usr/local/lib", "/usr/lib"]), ":")
+        else:
+            ld_library_path = [g_proton.lib_dir + "x86_64-linux-gnu", g_proton.lib_dir + "aarch64-linux-gnu", g_proton.lib_dir + "i386-linux-gnu"]
+            prepend_to_env_str(self.env, ld_path_var, ':'.join(ld_library_path), ":")
 
         dllpaths = [g_proton.lib_dir + "vkd3d", g_proton.lib_dir + "wine"]
         if "WINEDLLPATH" in os.environ:
@@ -1740,7 +1766,7 @@ class Session:
         self.check_environment("PROTON_FORCE_NVAPI", "forcenvapi")
         self.check_environment("PROTON_HIDE_APU", "hideapu")
 
-        if "nofsync" in self.compat_config:
+        if "nofsync" in self.compat_config or IS_DARWIN:
             self.env.pop("WINEFSYNC", "")
         else:
             self.env["WINEFSYNC"] = "1"
@@ -2075,7 +2101,7 @@ class Session:
                 ]:
             argv = [g_proton.wine_bin, "c:\\Program Files (x86)\\Steam\\steam.exe"]
         else:
-            if g_proton.host_pe_arch == "x86_64-windows":
+            if g_proton.host_pe_arch == "x86_64-windows" and not IS_DARWIN:
                 #run with winepreloader directly to avoid restart through start.exe
                 self.env["WINELOADERNOEXEC"] = "1"
                 argv = [g_proton.lib_dir + "/wine/x86_64-unix/wine-preloader", g_proton.lib_dir + "/wine/x86_64-unix/wine", "c:\\windows\\system32\\steam.exe"]
