@@ -1766,7 +1766,12 @@ class Session:
         self.check_environment("PROTON_FORCE_NVAPI", "forcenvapi")
         self.check_environment("PROTON_HIDE_APU", "hideapu")
 
-        if "nofsync" in self.compat_config or IS_DARWIN:
+        if IS_DARWIN:
+            # msync: fsync's shared-memory objects with futexes emulated on XNU ulocks
+            # (wine/darwin_futex.h). Same opt-out pattern as fsync.
+            self.check_environment("PROTON_NO_MSYNC", "nofsync")
+
+        if "nofsync" in self.compat_config:
             self.env.pop("WINEFSYNC", "")
         else:
             self.env["WINEFSYNC"] = "1"
